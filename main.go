@@ -18,21 +18,6 @@ var links = []string{
 	"https://www.spacex.com/",
 }
 
-type Set struct {
-	exist     map[string]bool
-	container []string
-}
-
-func (s *Set) Add(element string) {
-	if !s.exist[element] {
-		s.container = append(s.container, element)
-	}
-}
-
-func (s *Set) GetArray() []string {
-	return s.container
-}
-
 type Request struct {
 	ResponseWriter http.ResponseWriter
 	Request        *http.Request
@@ -70,7 +55,6 @@ type LinksWithTitle struct {
 }
 
 func requestAndSearch(request Request, mainLink string, clearLinks []string) ([]LinksWithTitle, error) {
-	// var haveSearchText *Set = &Set{}
 	errorChan := make(chan error)
 	doneChan := make(chan int)
 
