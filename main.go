@@ -15,7 +15,8 @@ import (
 )
 
 var links = []string{
-	"https://www.spacex.com/",
+	"https://www.veriff.com/",
+	"https://go.dev/",
 }
 
 type LinksWithTitle struct {
@@ -35,19 +36,24 @@ type ErrorObject struct {
 	Code    int    `json:"code"`
 }
 
+type ResultSearch struct {
+	Host  string           `json:"host"`
+	Links []LinksWithTitle `json:"links"`
+}
+
 type ResponseObject struct {
-	Error *ErrorObject                `json:"error"`
-	Body  map[string][]LinksWithTitle `json:"body"`
+	Error *ErrorObject   `json:"error"`
+	Body  []ResultSearch `json:"body"`
 }
 
 func (r Request) errorResponse(status int, message string) {
-	r.ResponseWriter.WriteHeader(http.StatusBadGateway)
+	r.ResponseWriter.WriteHeader(status)
 	responseMsg := ResponseObject{Error: &ErrorObject{Message: message, Code: status}}
 	jsonContent, _ := json.Marshal(responseMsg)
 	fmt.Fprintf(r.ResponseWriter, string(jsonContent))
 }
 
-func (r Request) successResponse(links map[string][]LinksWithTitle) {
+func (r Request) successResponse(links []ResultSearch) {
 	r.ResponseWriter.WriteHeader(http.StatusOK)
 	responseMsg := ResponseObject{Body: links}
 	jsonContent, _ := json.Marshal(responseMsg)
@@ -55,6 +61,7 @@ func (r Request) successResponse(links map[string][]LinksWithTitle) {
 }
 
 func getLinkWithTitle(requestLink string, hostLink string, searchText string, linkChan chan<- LinksWithTitle, errChan chan<- error) {
+
 	requestURL := &url.URL{Host: hostLink[8 : len(hostLink)-1], Scheme: "https", Path: requestLink}
 
 	response, err := http.Get(requestURL.String())
@@ -64,26 +71,19 @@ func getLinkWithTitle(requestLink string, hostLink string, searchText string, li
 	}
 	defer response.Body.Close()
 	bytes, _ := io.ReadAll(response.Body)
-	if strings.Index(string(bytes), searchText) != -1 {
+	if strings.Contains(string(bytes), searchText) {
 		linkChan <- LinksWithTitle{Title: parser.ExtractTitle(bytes), Link: requestLink}
 	} else {
 		linkChan <- LinksWithTitle{}
 	}
 }
 
-func requestAndSearch(request Request, hostLink string, clearLinks []string) ([]LinksWithTitle, error) {
+func requestAndSearch(searchText string, hostLink string, clearLinks []string) ([]LinksWithTitle, error) {
 	errorChan := make(chan error)
 	linkChan := make(chan LinksWithTitle)
 
-	uniqueLinks := make(map[string]bool)
-
 	for _, clearLink := range clearLinks {
-		if uniqueLinks[clearLink] {
-			continue
-		} else {
-			uniqueLinks[clearLink] = true
-			go getLinkWithTitle(clearLink, hostLink, request.SearchText, linkChan, errorChan)
-		}
+		go getLinkWithTitle(clearLink, hostLink, searchText, linkChan, errorChan)
 	}
 
 	var result []LinksWithTitle
@@ -107,37 +107,66 @@ func requestAndSearch(request Request, hostLink string, clearLinks []string) ([]
 	}
 }
 
+type SearchResultLinksByHost struct {
+	Link  string
+	Links []LinksWithTitle
+}
+
+func SearchTextByHost(link string, searchText string, result chan<- SearchResultLinksByHost, errorChan chan<- error) {
+	response, err := http.Get(link)
+	if err != nil {
+		errorChan <- err
+		return
+	}
+	defer response.Body.Close()
+	bytes, _ := io.ReadAll(response.Body)
+
+	clearLinks := parser.ExtractLinks(bytes)
+
+	haveSearchText, err := requestAndSearch(searchText, link, clearLinks)
+	if err != nil {
+		errorChan <- err
+		return
+	}
+
+	result <- SearchResultLinksByHost{Link: link, Links: haveSearchText}
+}
+
 func SearchHandler(request Request) {
 	if request.SearchText == "" {
 		request.errorResponse(http.StatusBadRequest, "Nothing to find")
 		return
 	}
-	pageLinks := make(map[string][]LinksWithTitle)
+	resultLinks := make(chan SearchResultLinksByHost)
+	errorChan := make(chan error)
+
+	var pageLinks []ResultSearch
+
 	for _, link := range links {
-		response, err := http.Get(link)
-		if err != nil {
-			request.errorResponse(http.StatusBadGateway, fmt.Sprintf("Error: %s", err))
-			return
-		}
-		defer response.Body.Close()
-		bytes, _ := io.ReadAll(response.Body)
-
-		clearLinks := parser.ExtractLinks(bytes)
-
-		haveSearchText, err := requestAndSearch(request, link, clearLinks)
-
-		if err != nil {
-			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
-			return
-		}
-
-		pageLinks[link] = haveSearchText
+		go SearchTextByHost(link, request.SearchText, resultLinks, errorChan)
 	}
 
-	request.successResponse(pageLinks)
+	done := 0
+	for {
+		select {
+		case err := <-errorChan:
+			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
+			return
+		case result := <-resultLinks:
+			pageLinks = append(pageLinks, ResultSearch{Host: result.Link, Links: result.Links})
+			done++
+			if done == len(links) {
+				request.successResponse(pageLinks)
+				return
+			}
+		case <-time.After(time.Second * 60):
+			request.errorResponse(http.StatusRequestTimeout, fmt.Sprint("Time limit exceed"))
+			return
+		}
+	}
 }
 
-func mainHandler(fn func(Request)) http.HandlerFunc {
+func mainHandler(fn func(Request), method string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "application/json")
 		requestObject := Request{
@@ -146,12 +175,17 @@ func mainHandler(fn func(Request)) http.HandlerFunc {
 			Params:         r.URL.Query(),
 			SearchText:     r.URL.Query().Get("text"),
 		}
+
+		if method != r.Method {
+			requestObject.errorResponse(http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+
 		fn(requestObject)
 	}
 }
 
 func main() {
-
-	http.HandleFunc("/search", mainHandler(SearchHandler))
+	http.HandleFunc("/search", mainHandler(SearchHandler, "GET"))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
