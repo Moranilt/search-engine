@@ -12,52 +12,18 @@ import (
 	"time"
 
 	"example.com/links-parser/parser"
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
 )
 
-var links = []string{
-	"https://www.veriff.com/",
-	"https://go.dev/",
-}
+const (
+	BodyIsNotValid   = "Request body is not valid"
+	MethodNotAllowed = "Method not allowed"
+)
 
 type LinksWithTitle struct {
 	Title string `json:"title"`
 	Link  string `json:"link"`
-}
-
-type Request struct {
-	ResponseWriter http.ResponseWriter
-	Request        *http.Request
-	Params         url.Values
-	SearchText     string
-}
-
-type ErrorObject struct {
-	Message string `json:"message"`
-	Code    int    `json:"code"`
-}
-
-type ResultSearch struct {
-	Host  string           `json:"host"`
-	Links []LinksWithTitle `json:"links"`
-}
-
-type ResponseObject struct {
-	Error *ErrorObject   `json:"error"`
-	Body  []ResultSearch `json:"body"`
-}
-
-func (r Request) errorResponse(status int, message string) {
-	r.ResponseWriter.WriteHeader(status)
-	responseMsg := ResponseObject{Error: &ErrorObject{Message: message, Code: status}}
-	jsonContent, _ := json.Marshal(responseMsg)
-	fmt.Fprintf(r.ResponseWriter, string(jsonContent))
-}
-
-func (r Request) successResponse(links []ResultSearch) {
-	r.ResponseWriter.WriteHeader(http.StatusOK)
-	responseMsg := ResponseObject{Body: links}
-	jsonContent, _ := json.Marshal(responseMsg)
-	fmt.Fprintf(r.ResponseWriter, string(jsonContent))
 }
 
 func getLinkWithTitle(requestLink string, hostLink string, searchText string, linkChan chan<- LinksWithTitle, errChan chan<- error) {
@@ -112,27 +78,40 @@ type SearchResultLinksByHost struct {
 	Links []LinksWithTitle
 }
 
-func SearchTextByHost(link string, searchText string, result chan<- SearchResultLinksByHost, errorChan chan<- error) {
-	response, err := http.Get(link)
-	if err != nil {
-		errorChan <- err
-		return
-	}
-	defer response.Body.Close()
-	bytes, _ := io.ReadAll(response.Body)
+func (repository Repository) SearchTextByHost(host Host, searchText string, result chan<- SearchResultLinksByHost, errorChan chan<- error) {
 
-	clearLinks := parser.ExtractLinks(bytes)
+	var searchResult []LinksWithTitle
 
-	haveSearchText, err := requestAndSearch(searchText, link, clearLinks)
-	if err != nil {
-		errorChan <- err
-		return
+	eWithSearchText := host.GetEndpointsWithSearchPhrase(repository.DB, searchText)
+	eWithoutSearchText := host.GetEndpointsWithoutSearchPhrase(repository.DB, searchText)
+
+	for _, endpoint := range eWithSearchText {
+		searchResult = append(searchResult, LinksWithTitle{Title: endpoint.Title, Link: endpoint.Path})
 	}
 
-	result <- SearchResultLinksByHost{Link: link, Links: haveSearchText}
+	if len(eWithoutSearchText) > 0 {
+		haveSearchText, err := requestAndSearch(searchText, host.Name, eWithoutSearchText)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+		host.MustBegin(repository.DB)
+		for _, endpoint := range haveSearchText {
+			host.StoreEndpointByPhrase(endpoint.Link, searchText, endpoint.Title)
+		}
+		host.Commit()
+
+		if err != nil {
+			errorChan <- err
+			return
+		}
+		searchResult = append(searchResult, haveSearchText...)
+	}
+
+	result <- SearchResultLinksByHost{Link: host.Name, Links: searchResult}
 }
 
-func SearchHandler(request Request) {
+func (repository Repository) SearchHandler(request Request) {
 	if request.SearchText == "" {
 		request.errorResponse(http.StatusBadRequest, "Nothing to find")
 		return
@@ -142,8 +121,11 @@ func SearchHandler(request Request) {
 
 	var pageLinks []ResultSearch
 
-	for _, link := range links {
-		go SearchTextByHost(link, request.SearchText, resultLinks, errorChan)
+	var hosts []Host
+	repository.DB.Select(&hosts, SelectAllFromHosts)
+
+	for _, link := range hosts {
+		go repository.SearchTextByHost(link, request.SearchText, resultLinks, errorChan)
 	}
 
 	done := 0
@@ -153,9 +135,11 @@ func SearchHandler(request Request) {
 			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
 			return
 		case result := <-resultLinks:
-			pageLinks = append(pageLinks, ResultSearch{Host: result.Link, Links: result.Links})
 			done++
-			if done == len(links) {
+			if len(result.Links) > 0 {
+				pageLinks = append(pageLinks, ResultSearch{Host: result.Link, Links: result.Links})
+			}
+			if done == len(hosts) {
 				request.successResponse(pageLinks)
 				return
 			}
@@ -166,26 +150,146 @@ func SearchHandler(request Request) {
 	}
 }
 
-func mainHandler(fn func(Request), method string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Content-Type", "application/json")
-		requestObject := Request{
-			ResponseWriter: w,
-			Request:        r,
-			Params:         r.URL.Query(),
-			SearchText:     r.URL.Query().Get("text"),
-		}
+func (repository Repository) HostsPostHandler(request Request) {
+	requestBody, err := io.ReadAll(request.Request.Body)
 
-		if method != r.Method {
-			requestObject.errorResponse(http.StatusMethodNotAllowed, "Method not allowed")
+	if err != nil {
+		request.errorResponse(http.StatusBadRequest, BodyIsNotValid)
+		return
+	}
+
+	var hosts []string
+
+	err = json.Unmarshal(requestBody, &hosts)
+
+	if err != nil {
+		request.errorResponse(http.StatusBadRequest, BodyIsNotValid)
+		return
+	}
+
+	var successCounter int
+
+	for _, host := range hosts {
+		result := repository.DB.MustExec(CreateHostQuery, host)
+		r, _ := result.RowsAffected()
+		if r > 0 {
+			successCounter++
+		}
+	}
+
+	request.successResponseHostsPost(successCounter)
+}
+
+func (repository Repository) HostsGetHandler(request Request) {
+	var hosts []Host
+
+	repository.DB.Select(&hosts, "SELECT * FROM hosts")
+
+	var hostsWithEndpoints []HostWithEndpoints
+
+	for _, host := range hosts {
+		hostsWithEndpoints = append(
+			hostsWithEndpoints,
+			HostWithEndpoints{
+				Host:         host.Name,
+				IsSearchable: host.IsSearchable,
+				Endpoints:    host.GetEndpoints(repository.DB),
+			},
+		)
+	}
+
+	request.successResponseHostsGet(hostsWithEndpoints)
+}
+
+// Add all endpoints by host to DB and activate host
+func (repository Repository) ActivateHosts(request Request) {
+	defer request.Request.Body.Close()
+	body, _ := io.ReadAll(request.Request.Body)
+	var hosts []string
+	err := json.Unmarshal(body, &hosts)
+
+	if err != nil {
+		request.errorResponse(http.StatusBadRequest, fmt.Sprint(err))
+		return
+	}
+
+	var selectAllHostsByName strings.Builder
+	selectAllHostsByName.WriteString("SELECT * FROM hosts WHERE ")
+	for i, host := range hosts {
+		if i == len(hosts)-1 {
+			selectAllHostsByName.WriteString(fmt.Sprintf("name='%s'", host))
+		} else {
+			selectAllHostsByName.WriteString(fmt.Sprintf("name='%s' OR ", host))
+		}
+	}
+
+	var dbHosts []Host
+	repository.DB.Select(&dbHosts, selectAllHostsByName.String())
+
+	var addedEndpoints int
+	for _, host := range dbHosts {
+
+		response, err := http.Get(host.Name)
+		if err != nil {
+			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
 			return
 		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		clearLinks := parser.ExtractLinks(body)
 
-		fn(requestObject)
+		host.MustBegin(repository.DB)
+		titleChan := make(chan LinksWithTitle)
+		for _, link := range clearLinks {
+			go exploreEndpointsTitle(host, link, titleChan)
+		}
+
+		for i := 0; i < len(clearLinks); i++ {
+			linkWithTitle := <-titleChan
+			host.NewEndpoint(linkWithTitle.Link, linkWithTitle.Title)
+		}
+		err = host.Commit()
+		if err != nil {
+			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
+			return
+		}
+		repository.DB.MustExec(ChangeHostsIsSearchableState, host.Name)
 	}
+
+	request.successResponseHostsPost(addedEndpoints)
+}
+
+func exploreEndpointsTitle(host Host, link string, titleChan chan<- LinksWithTitle) {
+	requestURL := &url.URL{Host: host.Name[8 : len(host.Name)-1], Scheme: "https", Path: link}
+
+	response, err := http.Get(requestURL.String())
+	if err != nil {
+		return
+	}
+
+	defer response.Body.Close()
+
+	html, _ := io.ReadAll(response.Body)
+	if err != nil {
+		return
+	}
+	titleChan <- LinksWithTitle{Link: link, Title: parser.ExtractTitle(html)}
 }
 
 func main() {
-	http.HandleFunc("/search", mainHandler(SearchHandler, "GET"))
+	db, err := sqlx.Connect("postgres", "user=root password=123456 dbname=search_engine sslmode=disable")
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	repository := Repository{
+		DB: db,
+	}
+
+	http.HandleFunc("/hosts/activate", mainHandler(repository.ActivateHosts, "POST"))
+	http.HandleFunc("/search", mainHandler(repository.SearchHandler, "GET"))
+	http.HandleFunc("/hosts/add", mainHandler(repository.HostsPostHandler, "POST"))
+	http.HandleFunc("/hosts/list", mainHandler(repository.HostsGetHandler, "GET"))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
