@@ -26,8 +26,7 @@ type LinksWithTitle struct {
 	Link  string `json:"link"`
 }
 
-func getLinkWithTitle(requestLink string, hostLink string, searchText string, linkChan chan<- LinksWithTitle, errChan chan<- error) {
-
+func getLinkWithTitleBySearch(requestLink string, hostLink string, searchPhrase string, linkChan chan<- LinksWithTitle, errChan chan<- error) {
 	requestURL := &url.URL{Host: hostLink[8 : len(hostLink)-1], Scheme: "https", Path: requestLink}
 
 	response, err := http.Get(requestURL.String())
@@ -37,19 +36,19 @@ func getLinkWithTitle(requestLink string, hostLink string, searchText string, li
 	}
 	defer response.Body.Close()
 	bytes, _ := io.ReadAll(response.Body)
-	if strings.Contains(string(bytes), searchText) {
+	if strings.Contains(string(bytes), searchPhrase) {
 		linkChan <- LinksWithTitle{Title: parser.ExtractTitle(bytes), Link: requestLink}
 	} else {
 		linkChan <- LinksWithTitle{}
 	}
 }
 
-func requestAndSearch(searchText string, hostLink string, clearLinks []string) ([]LinksWithTitle, error) {
+func requestAndSearch(searchPhrase string, hostLink string, clearLinks []string) ([]LinksWithTitle, error) {
 	errorChan := make(chan error)
 	linkChan := make(chan LinksWithTitle)
 
 	for _, clearLink := range clearLinks {
-		go getLinkWithTitle(clearLink, hostLink, searchText, linkChan, errorChan)
+		go getLinkWithTitleBySearch(clearLink, hostLink, searchPhrase, linkChan, errorChan)
 	}
 
 	var result []LinksWithTitle
@@ -78,26 +77,26 @@ type SearchResultLinksByHost struct {
 	Links []LinksWithTitle
 }
 
-func (repository Repository) SearchTextByHost(host Host, searchText string, result chan<- SearchResultLinksByHost, errorChan chan<- error) {
+func (repository Repository) searchPhraseByHost(host Host, searchPhrase string, result chan<- SearchResultLinksByHost, errorChan chan<- error) {
 
 	var searchResult []LinksWithTitle
 
-	eWithSearchText := host.GetEndpointsWithSearchPhrase(repository.DB, searchText)
-	eWithoutSearchText := host.GetEndpointsWithoutSearchPhrase(repository.DB, searchText)
+	eWithSearchPhrase := host.GetEndpointsWithSearchPhrase(repository.DB, searchPhrase)
+	eWithoutSearchPhrase := host.GetEndpointsWithoutSearchPhrase(repository.DB, searchPhrase)
 
-	for _, endpoint := range eWithSearchText {
+	for _, endpoint := range eWithSearchPhrase {
 		searchResult = append(searchResult, LinksWithTitle{Title: endpoint.Title, Link: endpoint.Path})
 	}
 
-	if len(eWithoutSearchText) > 0 {
-		haveSearchText, err := requestAndSearch(searchText, host.Name, eWithoutSearchText)
+	if len(eWithoutSearchPhrase) > 0 {
+		haveSearchPhrase, err := requestAndSearch(searchPhrase, host.Name, eWithoutSearchPhrase)
 		if err != nil {
 			errorChan <- err
 			return
 		}
 		host.MustBegin(repository.DB)
-		for _, endpoint := range haveSearchText {
-			host.StoreEndpointByPhrase(endpoint.Link, searchText, endpoint.Title)
+		for _, endpoint := range haveSearchPhrase {
+			host.StoreEndpointByPhrase(endpoint.Link, searchPhrase, endpoint.Title)
 		}
 		host.Commit()
 
@@ -105,14 +104,14 @@ func (repository Repository) SearchTextByHost(host Host, searchText string, resu
 			errorChan <- err
 			return
 		}
-		searchResult = append(searchResult, haveSearchText...)
+		searchResult = append(searchResult, haveSearchPhrase...)
 	}
 
 	result <- SearchResultLinksByHost{Link: host.Name, Links: searchResult}
 }
 
 func (repository Repository) SearchHandler(request Request) {
-	if request.SearchText == "" {
+	if request.SearchPhrase == "" {
 		request.errorResponse(http.StatusBadRequest, "Nothing to find")
 		return
 	}
@@ -125,7 +124,7 @@ func (repository Repository) SearchHandler(request Request) {
 	repository.DB.Select(&hosts, SelectAllFromHosts)
 
 	for _, link := range hosts {
-		go repository.SearchTextByHost(link, request.SearchText, resultLinks, errorChan)
+		go repository.searchPhraseByHost(link, request.SearchPhrase, resultLinks, errorChan)
 	}
 
 	done := 0
@@ -150,7 +149,7 @@ func (repository Repository) SearchHandler(request Request) {
 	}
 }
 
-func (repository Repository) HostsPostHandler(request Request) {
+func (repository Repository) POST_HostsHandler(request Request) {
 	requestBody, err := io.ReadAll(request.Request.Body)
 
 	if err != nil {
@@ -180,7 +179,7 @@ func (repository Repository) HostsPostHandler(request Request) {
 	request.successResponseHostsPost(successCounter)
 }
 
-func (repository Repository) HostsGetHandler(request Request) {
+func (repository Repository) GET_HostsHandler(request Request) {
 	var hosts []Host
 
 	repository.DB.Select(&hosts, "SELECT * FROM hosts")
@@ -227,8 +226,8 @@ func (repository Repository) ActivateHosts(request Request) {
 	repository.DB.Select(&dbHosts, selectAllHostsByName.String())
 
 	var addedEndpoints int
-	for _, host := range dbHosts {
 
+	for _, host := range dbHosts {
 		response, err := http.Get(host.Name)
 		if err != nil {
 			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
@@ -239,13 +238,14 @@ func (repository Repository) ActivateHosts(request Request) {
 		clearLinks := parser.ExtractLinks(body)
 
 		host.MustBegin(repository.DB)
-		titleChan := make(chan LinksWithTitle)
+		resultChan := make(chan LinksWithTitle)
+
 		for _, link := range clearLinks {
-			go exploreEndpointsTitle(host, link, titleChan)
+			go getLinkWithTitle(host, link, resultChan)
 		}
 
 		for i := 0; i < len(clearLinks); i++ {
-			linkWithTitle := <-titleChan
+			linkWithTitle := <-resultChan
 			host.NewEndpoint(linkWithTitle.Link, linkWithTitle.Title)
 		}
 		err = host.Commit()
@@ -259,7 +259,7 @@ func (repository Repository) ActivateHosts(request Request) {
 	request.successResponseHostsPost(addedEndpoints)
 }
 
-func exploreEndpointsTitle(host Host, link string, titleChan chan<- LinksWithTitle) {
+func getLinkWithTitle(host Host, link string, resultChan chan<- LinksWithTitle) {
 	requestURL := &url.URL{Host: host.Name[8 : len(host.Name)-1], Scheme: "https", Path: link}
 
 	response, err := http.Get(requestURL.String())
@@ -273,7 +273,7 @@ func exploreEndpointsTitle(host Host, link string, titleChan chan<- LinksWithTit
 	if err != nil {
 		return
 	}
-	titleChan <- LinksWithTitle{Link: link, Title: parser.ExtractTitle(html)}
+	resultChan <- LinksWithTitle{Link: link, Title: parser.ExtractTitle(html)}
 }
 
 func main() {
@@ -289,7 +289,7 @@ func main() {
 
 	http.HandleFunc("/hosts/activate", mainHandler(repository.ActivateHosts, "POST"))
 	http.HandleFunc("/search", mainHandler(repository.SearchHandler, "GET"))
-	http.HandleFunc("/hosts/add", mainHandler(repository.HostsPostHandler, "POST"))
-	http.HandleFunc("/hosts/list", mainHandler(repository.HostsGetHandler, "GET"))
+	http.HandleFunc("/hosts/add", mainHandler(repository.POST_HostsHandler, "POST"))
+	http.HandleFunc("/hosts/list", mainHandler(repository.GET_HostsHandler, "GET"))
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

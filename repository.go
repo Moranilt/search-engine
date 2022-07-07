@@ -17,7 +17,7 @@ type Request struct {
 	ResponseWriter http.ResponseWriter
 	Request        *http.Request
 	Params         url.Values
-	SearchText     string
+	SearchPhrase   string
 }
 
 type ErrorObject struct {
@@ -81,7 +81,7 @@ func mainHandler(fn func(Request), method string) http.HandlerFunc {
 			ResponseWriter: w,
 			Request:        r,
 			Params:         r.URL.Query(),
-			SearchText:     r.URL.Query().Get("text"),
+			SearchPhrase:   r.URL.Query().Get("text"),
 		}
 
 		if method != r.Method {
