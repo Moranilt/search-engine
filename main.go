@@ -283,13 +283,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	repository := Repository{
-		DB: db,
-	}
+	repository := NewRepository(db)
 
-	http.HandleFunc("/hosts/activate", mainHandler(repository.ActivateHosts, "POST"))
-	http.HandleFunc("/search", mainHandler(repository.SearchHandler, "GET"))
-	http.HandleFunc("/hosts/add", mainHandler(repository.POST_HostsHandler, "POST"))
-	http.HandleFunc("/hosts/list", mainHandler(repository.GET_HostsHandler, "GET"))
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	repository.Get("/search", repository.SearchHandler)
+	repository.Get("/hosts/list", repository.GET_HostsHandler)
+	repository.Post("/hosts/add", repository.POST_HostsHandler)
+	repository.Post("/hosts/activate", repository.ActivateHosts)
+	log.Fatal(http.ListenAndServe(":8080", repository))
 }
