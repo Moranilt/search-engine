@@ -1,4 +1,4 @@
-module example.com/links-parser
+module github.com/Moranilt/search-engine
 
 go 1.18
 

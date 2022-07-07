@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"example.com/links-parser/parser"
+	"github.com/Moranilt/search-engine/parser"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 )
