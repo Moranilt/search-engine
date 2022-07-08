@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Moranilt/rou"
 	"github.com/Moranilt/search-engine/parser"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
@@ -110,9 +111,10 @@ func (repository Repository) searchPhraseByHost(host Host, searchPhrase string, 
 	result <- SearchResultLinksByHost{Link: host.Name, Links: searchResult}
 }
 
-func (repository Repository) SearchHandler(request Request) {
-	if request.SearchPhrase == "" {
-		request.errorResponse(http.StatusBadRequest, "Nothing to find")
+func (repository Repository) SearchHandler(request *rou.Context) {
+	searchPhrase := request.Params().Get("text")
+	if searchPhrase == "" {
+		request.ErrorJSONResponse(http.StatusBadRequest, "Nothing to find")
 		return
 	}
 	resultLinks := make(chan SearchResultLinksByHost)
@@ -124,14 +126,14 @@ func (repository Repository) SearchHandler(request Request) {
 	repository.DB.Select(&hosts, SelectAllFromHosts)
 
 	for _, link := range hosts {
-		go repository.searchPhraseByHost(link, request.SearchPhrase, resultLinks, errorChan)
+		go repository.searchPhraseByHost(link, searchPhrase, resultLinks, errorChan)
 	}
 
 	done := 0
 	for {
 		select {
 		case err := <-errorChan:
-			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
+			request.ErrorJSONResponse(http.StatusBadGateway, fmt.Sprint(err))
 			return
 		case result := <-resultLinks:
 			done++
@@ -139,21 +141,21 @@ func (repository Repository) SearchHandler(request Request) {
 				pageLinks = append(pageLinks, ResultSearch{Host: result.Link, Links: result.Links})
 			}
 			if done == len(hosts) {
-				request.successResponse(pageLinks)
+				request.SuccessJSONResponse(pageLinks)
 				return
 			}
 		case <-time.After(time.Second * 60):
-			request.errorResponse(http.StatusRequestTimeout, fmt.Sprint("Time limit exceed"))
+			request.ErrorJSONResponse(http.StatusRequestTimeout, fmt.Sprint("Time limit exceed"))
 			return
 		}
 	}
 }
 
-func (repository Repository) POST_HostsHandler(request Request) {
-	requestBody, err := io.ReadAll(request.Request.Body)
+func (repository Repository) POST_HostsHandler(request *rou.Context) {
+	requestBody, err := io.ReadAll(request.Request().Body)
 
 	if err != nil {
-		request.errorResponse(http.StatusBadRequest, BodyIsNotValid)
+		request.ErrorJSONResponse(http.StatusBadRequest, BodyIsNotValid)
 		return
 	}
 
@@ -162,7 +164,7 @@ func (repository Repository) POST_HostsHandler(request Request) {
 	err = json.Unmarshal(requestBody, &hosts)
 
 	if err != nil {
-		request.errorResponse(http.StatusBadRequest, BodyIsNotValid)
+		request.ErrorJSONResponse(http.StatusBadRequest, BodyIsNotValid)
 		return
 	}
 
@@ -176,10 +178,10 @@ func (repository Repository) POST_HostsHandler(request Request) {
 		}
 	}
 
-	request.successResponseHostsPost(successCounter)
+	request.SuccessJSONResponse(successCounter)
 }
 
-func (repository Repository) GET_HostsHandler(request Request) {
+func (repository Repository) GET_HostsHandler(request *rou.Context) {
 	var hosts []Host
 
 	repository.DB.Select(&hosts, "SELECT * FROM hosts")
@@ -197,18 +199,18 @@ func (repository Repository) GET_HostsHandler(request Request) {
 		)
 	}
 
-	request.successResponseHostsGet(hostsWithEndpoints)
+	request.SuccessJSONResponse(hostsWithEndpoints)
 }
 
 // Add all endpoints by host to DB and activate host
-func (repository Repository) ActivateHosts(request Request) {
-	defer request.Request.Body.Close()
-	body, _ := io.ReadAll(request.Request.Body)
+func (repository Repository) ActivateHosts(request *rou.Context) {
+	defer request.Request().Body.Close()
+	body, _ := io.ReadAll(request.Request().Body)
 	var hosts []string
 	err := json.Unmarshal(body, &hosts)
 
 	if err != nil {
-		request.errorResponse(http.StatusBadRequest, fmt.Sprint(err))
+		request.ErrorJSONResponse(http.StatusBadRequest, fmt.Sprint(err))
 		return
 	}
 
@@ -230,7 +232,7 @@ func (repository Repository) ActivateHosts(request Request) {
 	for _, host := range dbHosts {
 		response, err := http.Get(host.Name)
 		if err != nil {
-			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
+			request.ErrorJSONResponse(http.StatusBadGateway, fmt.Sprint(err))
 			return
 		}
 		defer response.Body.Close()
@@ -250,13 +252,13 @@ func (repository Repository) ActivateHosts(request Request) {
 		}
 		err = host.Commit()
 		if err != nil {
-			request.errorResponse(http.StatusBadGateway, fmt.Sprint(err))
+			request.ErrorJSONResponse(http.StatusBadGateway, fmt.Sprint(err))
 			return
 		}
 		repository.DB.MustExec(ChangeHostsIsSearchableState, host.Name)
 	}
 
-	request.successResponseHostsPost(addedEndpoints)
+	request.SuccessJSONResponse(addedEndpoints)
 }
 
 func getLinkWithTitle(host Host, link string, resultChan chan<- LinksWithTitle) {
@@ -284,10 +286,11 @@ func main() {
 	}
 
 	repository := NewRepository(db)
+	router := rou.NewRouter()
 
-	repository.Get("/search", repository.SearchHandler)
-	repository.Get("/hosts/list", repository.GET_HostsHandler)
-	repository.Post("/hosts/add", repository.POST_HostsHandler)
-	repository.Post("/hosts/activate", repository.ActivateHosts)
-	log.Fatal(http.ListenAndServe(":8080", repository))
+	router.Get("/search", repository.SearchHandler)
+	router.Get("/hosts/list", repository.GET_HostsHandler)
+	router.Post("/hosts/add", repository.POST_HostsHandler)
+	router.Post("/hosts/activate", repository.ActivateHosts)
+	log.Fatal(router.RunServer(":8080"))
 }
